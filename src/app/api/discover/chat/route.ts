@@ -1,8 +1,6 @@
 import Groq from "groq-sdk";
 import { NextRequest, NextResponse } from "next/server";
 
-const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
 const SYSTEM_PROMPT = `You are a skilled business discovery consultant working for 11-8 AI, a value-based AI automation company. You're conducting a live discovery session with a business owner.
 
 Your mission: Have a natural, warm conversation that uncovers their biggest operational pain points, quantifies the cost of those problems, and walks them toward understanding how AI automation can solve them — culminating in a fair value-share agreement.
@@ -104,6 +102,7 @@ ${notes ? `Pre-session notes: ${notes}` : ""}
 
 Start the conversation naturally — greet them and open with a broad question about their business.`;
 
+    const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const response = await client.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       max_tokens: 1024,
