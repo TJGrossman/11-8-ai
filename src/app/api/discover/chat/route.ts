@@ -1,7 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
+import Groq from "groq-sdk";
 import { NextRequest, NextResponse } from "next/server";
 
-const client = new Anthropic();
+const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const SYSTEM_PROMPT = `You are a skilled business discovery consultant working for 11-8 AI, a value-based AI automation company. You're conducting a live discovery session with a business owner.
 
@@ -104,17 +104,19 @@ ${notes ? `Pre-session notes: ${notes}` : ""}
 
 Start the conversation naturally — greet them and open with a broad question about their business.`;
 
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-6",
+    const response = await client.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
       max_tokens: 1024,
-      system: systemWithContext,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      messages: [
+        { role: "system", content: systemWithContext },
+        ...messages.map((m) => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        })),
+      ],
     });
 
-    const rawContent = response.content[0].type === "text" ? response.content[0].text : "";
+    const rawContent = response.choices[0]?.message?.content ?? "";
 
     // Parse JSON response from Claude
     let parsed: { message: string; insights: InsightData };
