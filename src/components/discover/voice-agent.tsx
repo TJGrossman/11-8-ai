@@ -50,23 +50,35 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
   const [muted, setMuted] = useState(false);
   const [browserSupported, setBrowserSupported] = useState(true);
 
+  // Refs — always current, safe to use inside event handlers / callbacks
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
-  const synthRef = useRef<SpeechSynthesis | null>(null);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const agentStateRef = useRef<AgentState>("idle"); // mirrors agentState for callbacks
   const isSpeakingRef = useRef(false);
   const pendingUserTextRef = useRef("");
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]); // mirrors messages for callbacks
+  const mutedRef = useRef(false);
+
+  // Keep refs in sync with state
+  useEffect(() => { agentStateRef.current = agentState; }, [agentState]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { mutedRef.current = muted; }, [muted]);
+
+  const setState = useCallback((s: AgentState) => {
+    agentStateRef.current = s;
+    setAgentState(s);
+  }, []);
 
   // Check browser support
   useEffect(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const w = window as any;
-    const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!SR) {
+    if (!w.SpeechRecognition && !w.webkitSpeechRecognition) {
       setBrowserSupported(false);
     }
-    synthRef.current = window.speechSynthesis;
   }, []);
 
   // Auto-scroll transcript
@@ -74,7 +86,7 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcript, interimText]);
 
-  // Persist session to localStorage
+  // Persist session
   useEffect(() => {
     if (transcript.length > 0) {
       localStorage.setItem(
@@ -84,45 +96,99 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
     }
   }, [transcript, messages, insights, sessionId]);
 
-  const speak = useCallback((text: string, onEnd?: () => void) => {
-    if (!synthRef.current || muted) {
-      onEnd?.();
-      return;
-    }
-    synthRef.current.cancel();
-    isSpeakingRef.current = true;
-    setAgentState("speaking");
+  // Forward-declared ref so callAgent and startListening can reference each other
+  const startListeningRef = useRef<() => void>(() => {});
+  const callAgentRef = useRef<(userText: string, msgs: ChatMessage[]) => void>(() => {});
 
+  const speakFallback = useCallback((text: string, onEnd?: () => void) => {
+    const synth = window.speechSynthesis;
+    synth.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.92;
+    utterance.rate = 0.88;
     utterance.pitch = 1.0;
 
-    // Prefer a natural-sounding voice
-    const voices = synthRef.current.getVoices();
-    const preferred = voices.find(
-      (v) =>
-        v.name.includes("Samantha") ||
-        v.name.includes("Karen") ||
-        v.name.includes("Google US English") ||
-        v.name.includes("en-US")
-    );
-    if (preferred) utterance.voice = preferred;
+    const voices = synth.getVoices();
+    const enVoices = voices.filter(v => v.lang.startsWith("en"));
 
-    utterance.onend = () => {
+    // Priority order — best sounding macOS/Chrome voices first
+    const priority = [
+      "Ava (Enhanced)",
+      "Allison (Enhanced)",
+      "Samantha (Enhanced)",
+      "Susan (Enhanced)",
+      "Victoria (Enhanced)",
+      "Ava",
+      "Allison",
+      "Samantha",
+      "Google US English",
+      "Google UK English Female",
+    ];
+
+    let chosen: SpeechSynthesisVoice | undefined;
+    for (const name of priority) {
+      chosen = enVoices.find(v => v.name === name);
+      if (chosen) break;
+    }
+    // Fallback: any local en-US voice
+    if (!chosen) chosen = enVoices.find(v => v.lang === "en-US" && v.localService);
+    if (!chosen) chosen = enVoices.find(v => v.lang === "en-US");
+    if (chosen) utterance.voice = chosen;
+
+    console.log("Using voice:", chosen?.name ?? "browser default");
+
+    utterance.onend = () => { isSpeakingRef.current = false; onEnd?.(); };
+    utterance.onerror = () => { isSpeakingRef.current = false; onEnd?.(); };
+    synth.speak(utterance);
+  }, []);
+
+  const speak = useCallback(async (text: string, onEnd?: () => void) => {
+    isSpeakingRef.current = true;
+    setState("speaking");
+
+    if (mutedRef.current) {
       isSpeakingRef.current = false;
-      onEnd?.();
-    };
-    utterance.onerror = () => {
-      isSpeakingRef.current = false;
-      onEnd?.();
-    };
+      setTimeout(() => onEnd?.(), 300);
+      return;
+    }
 
-    synthRef.current.speak(utterance);
-  }, [muted]);
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
 
+      if (!res.ok) throw new Error("TTS failed");
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      currentAudioRef.current = audio;
+
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        currentAudioRef.current = null;
+        isSpeakingRef.current = false;
+        onEnd?.();
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        currentAudioRef.current = null;
+        isSpeakingRef.current = false;
+        onEnd?.();
+      };
+
+      await audio.play();
+    } catch (err) {
+      console.warn("ElevenLabs TTS failed, using browser fallback:", err);
+      speakFallback(text, onEnd);
+    }
+  }, [setState, speakFallback]);
+
+  // Main agent call — uses refs to avoid stale closures
   const callAgent = useCallback(
     async (userText: string, currentMessages: ChatMessage[]) => {
-      setAgentState("processing");
+      setState("processing");
 
       const newMessages: ChatMessage[] = userText
         ? [...currentMessages, { role: "user", content: userText }]
@@ -130,6 +196,7 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
 
       if (userText) {
         setMessages(newMessages);
+        messagesRef.current = newMessages;
         setTranscript((prev) => [
           ...prev,
           { role: "client", text: userText, timestamp: new Date() },
@@ -140,15 +207,11 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
         const res = await fetch("/api/discover/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages: newMessages,
-            businessName,
-            notes,
-          }),
+          body: JSON.stringify({ messages: newMessages, businessName, notes }),
         });
 
         const data = await res.json();
-        if (!data.message) throw new Error("No message in response");
+        if (!data.message) throw new Error("No message");
 
         const agentMessage = data.message as string;
         const newInsights = data.insights as InsightData;
@@ -160,6 +223,8 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
           { role: "assistant", content: agentMessage },
         ];
         setMessages(updatedMessages);
+        messagesRef.current = updatedMessages;
+
         setTranscript((prev) => [
           ...prev,
           { role: "agent", text: agentMessage, timestamp: new Date() },
@@ -167,32 +232,34 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
 
         speak(agentMessage, () => {
           if (!newInsights.agreedToTerms) {
-            startListening();
+            // Small delay to let browser audio context settle
+            setTimeout(() => startListeningRef.current(), 400);
           } else {
-            setAgentState("idle");
+            setState("idle");
           }
         });
       } catch (err) {
         console.error("Agent error:", err);
-        setAgentState("listening");
-        startListening();
+        setTimeout(() => startListeningRef.current(), 400);
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [businessName, notes, speak]
+    [businessName, notes, speak, setState]
   );
+
+  // Keep callAgentRef current
+  useEffect(() => { callAgentRef.current = callAgent; }, [callAgent]);
 
   const startListening = useCallback(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const w = window as any;
     const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
-
-    // Don't start if agent is speaking
     if (isSpeakingRef.current) return;
 
+    // Stop any existing recognition cleanly
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch { /* ignore */ }
+      try { recognitionRef.current.abort(); } catch { /* ignore */ }
+      recognitionRef.current = null;
     }
 
     const recognition = new SpeechRecognition();
@@ -200,18 +267,21 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = "en-US";
+    recognition.maxAlternatives = 1;
 
-    setAgentState("listening");
+    setState("listening");
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recognition.onresult = (event: any) => {
+      if (isSpeakingRef.current) return;
+
       let interim = "";
-      let final = "";
+      let finalText = "";
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         if (result.isFinal) {
-          final += result[0].transcript;
+          finalText += result[0].transcript;
         } else {
           interim += result[0].transcript;
         }
@@ -219,21 +289,21 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
 
       if (interim) setInterimText(interim);
 
-      if (final) {
-        pendingUserTextRef.current += " " + final;
+      if (finalText) {
+        pendingUserTextRef.current += " " + finalText;
         setInterimText("");
 
-        // Reset silence timer — send after 1.5s of silence
         if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         silenceTimerRef.current = setTimeout(() => {
           const userText = pendingUserTextRef.current.trim();
           pendingUserTextRef.current = "";
           if (userText) {
-            recognition.stop();
-            setMessages((prev) => {
-              callAgent(userText, prev);
-              return prev;
-            });
+            // Set state BEFORE abort so onend doesn't restart listening
+            agentStateRef.current = "processing";
+            setAgentState("processing");
+            try { recognition.abort(); } catch { /* ignore */ }
+            recognitionRef.current = null;
+            callAgentRef.current(userText, messagesRef.current);
           }
         }, 1500);
       }
@@ -241,49 +311,67 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recognition.onerror = (event: any) => {
-      if (event.error === "no-speech") {
-        // Restart silently
-        recognition.stop();
-        setTimeout(startListening, 300);
+      if (event.error === "aborted") return; // we triggered this, ignore
+      console.warn("Speech recognition error:", event.error);
+      // On no-speech or other errors, restart after a beat
+      recognitionRef.current = null;
+      if (!isSpeakingRef.current && agentStateRef.current === "listening") {
+        setTimeout(() => startListeningRef.current(), 500);
       }
     };
 
     recognition.onend = () => {
-      // Only restart if we're still supposed to be listening
-      if (agentState === "listening" && !isSpeakingRef.current) {
-        setTimeout(startListening, 300);
+      // Chrome stops continuous recognition periodically — restart if still listening
+      if (!isSpeakingRef.current && agentStateRef.current === "listening") {
+        setTimeout(() => startListeningRef.current(), 300);
       }
     };
 
-    recognition.start();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [callAgent]);
+    try {
+      recognition.start();
+    } catch (e) {
+      console.warn("Recognition start error:", e);
+    }
+  }, [setState]);
+
+  // Keep startListeningRef current
+  useEffect(() => { startListeningRef.current = startListening; }, [startListening]);
 
   const handleStart = useCallback(() => {
     setStarted(true);
-    // Kick off the conversation with empty user message (agent speaks first)
-    callAgent("", []);
-  }, [callAgent]);
+    callAgentRef.current("", []);
+  }, []);
 
-  const handleReset = () => {
-    synthRef.current?.cancel();
-    recognitionRef.current?.stop();
+  const handleReset = useCallback(() => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch { /* ignore */ }
+      recognitionRef.current = null;
+    }
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     setTranscript([]);
     setMessages([]);
+    messagesRef.current = [];
     setInsights(DEFAULT_INSIGHTS);
-    setAgentState("idle");
+    setState("idle");
     setStarted(false);
     isSpeakingRef.current = false;
     pendingUserTextRef.current = "";
     localStorage.removeItem(`voice-session-${sessionId}`);
-  };
+  }, [setState, sessionId]);
 
-  const toggleMute = () => {
-    if (!muted) {
-      synthRef.current?.cancel();
+  const toggleMute = useCallback(() => {
+    const next = !mutedRef.current;
+    mutedRef.current = next;
+    setMuted(next);
+    if (next && currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
     }
-    setMuted((m) => !m);
-  };
+  }, []);
 
   if (!browserSupported) {
     return (
@@ -313,12 +401,7 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
               </div>
             )}
             {started && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={toggleMute}
-                title={muted ? "Unmute agent" : "Mute agent"}
-              >
+              <Button variant="ghost" size="icon" onClick={toggleMute} title={muted ? "Unmute agent" : "Mute agent"}>
                 {muted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
               </Button>
             )}
@@ -332,7 +415,6 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
       </div>
 
       {!started ? (
-        /* Pre-start screen */
         <div className="flex flex-1 flex-col items-center justify-center gap-8 px-4">
           <div className="text-center">
             <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
@@ -354,37 +436,26 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
           </div>
         </div>
       ) : (
-        /* Live session */
         <div className="flex flex-1 overflow-hidden">
           {/* Left: transcript */}
-          <div className="flex w-full flex-col lg:w-3/5">
-            {/* Waveform + status */}
+          <div className="flex w-full flex-col lg:w-1/3">
             <div className="flex flex-col items-center gap-3 border-b border-border/40 bg-muted/20 px-4 py-6">
               <Waveform state={agentState} />
-              <div className="flex items-center gap-2">
-                <AnimatePresence mode="wait">
-                  <motion.span
-                    key={agentState}
-                    initial={{ opacity: 0, y: 4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    className={`text-sm font-medium ${
-                      agentState === "listening"
-                        ? "text-primary"
-                        : agentState === "speaking"
-                        ? "text-foreground"
-                        : agentState === "processing"
-                        ? "text-muted-foreground"
-                        : "text-muted-foreground"
-                    }`}
-                  >
-                    {STATE_LABELS[agentState]}
-                  </motion.span>
-                </AnimatePresence>
-              </div>
+              <AnimatePresence mode="wait">
+                <motion.span
+                  key={agentState}
+                  initial={{ opacity: 0, y: 4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  className={`text-sm font-medium ${
+                    agentState === "listening" ? "text-primary" : "text-muted-foreground"
+                  }`}
+                >
+                  {STATE_LABELS[agentState]}
+                </motion.span>
+              </AnimatePresence>
             </div>
 
-            {/* Transcript scroll */}
             <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4">
               <AnimatePresence initial={false}>
                 {transcript.map((entry, i) => (
@@ -407,7 +478,6 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
                 ))}
               </AnimatePresence>
 
-              {/* Interim text */}
               {interimText && (
                 <div className="flex justify-end">
                   <div className="max-w-[85%] rounded-2xl rounded-tr-sm border border-border/40 bg-muted/50 px-4 py-3 text-sm italic text-muted-foreground">
@@ -416,7 +486,6 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
                 </div>
               )}
 
-              {/* Processing indicator */}
               {agentState === "processing" && (
                 <div className="flex justify-start">
                   <div className="flex gap-1 rounded-2xl rounded-tl-sm border border-border/40 bg-card px-4 py-3">
@@ -435,8 +504,8 @@ export function VoiceAgent({ businessName, notes, sessionId }: VoiceAgentProps) 
             </div>
           </div>
 
-          {/* Right: insights panel */}
-          <div className="hidden lg:flex w-2/5 flex-col border-l border-border/40 bg-muted/10 p-4 overflow-y-auto">
+          {/* Right: insights */}
+          <div className="hidden lg:flex w-2/3 flex-col border-l border-border/40 bg-muted/10 p-4 overflow-y-auto">
             <div className="mb-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
               Live discoveries
             </div>
